@@ -68,7 +68,8 @@ if (parentPort) {
             ihashLockP2TR,
         } = message;
 
-        let sequence = seqStart;
+        let workId = Math.round(seqEnd / (seqEnd -seqStart)) - 1;
+        let sequence = seqEnd+1;
         let workerPerformBitworkForCommitTx = performBitworkForCommitTx;
         let scriptP2TR = iscriptP2TR;
         let hashLockP2TR = ihashLockP2TR;
@@ -126,6 +127,7 @@ if (parentPort) {
         let generated = 0;
         let lastTime = Date.now();
 
+        let psbtStart;
         // Start mining loop, terminates when a valid proof of work is found or stopped manually
         do {
             // If the sequence has exceeded the max sequence allowed, generate a newtime and reset the sequence until we find one.
@@ -146,43 +148,40 @@ if (parentPort) {
                 };
 
                 sequence = seqStart;
-            }
-            if (sequence % 10000 == 0) {
-                console.log(
-                    "Started mining for sequence: " +
-                        sequence +
-                        " - " +
-                        Math.min(sequence + 10000, MAX_SEQUENCE)
-                );
-            }
 
-            // Create a new PSBT (Partially Signed Bitcoin Transaction)
-            let psbtStart = new Psbt({ network: NETWORK });
-            psbtStart.setVersion(1);
+                // Create a new PSBT (Partially Signed Bitcoin Transaction)
+                psbtStart = new Psbt({ network: NETWORK });
+                psbtStart.setVersion(1);
 
-            // Add input and output to PSBT
-            psbtStart.addInput({
-                hash: fundingUtxo.txid,
-                index: fundingUtxo.index,
-                sequence: sequence,
-                tapInternalKey: tabInternalKey,
-                witnessUtxo: witnessUtxo,
-            });
-            psbtStart.addOutput(fixedOutput);
-
-            // Add change output if needed
-            if (needChangeFeeOutput) {
-                psbtStart.addOutput({
-                    address: fundingKeypair.address,
-                    value: differenceBetweenCalculatedAndExpected,
+                // Add input and output to PSBT
+                psbtStart.addInput({
+                    hash: fundingUtxo.txid,
+                    index: fundingUtxo.index,
+                    sequence: sequence,
+                    tapInternalKey: tabInternalKey,
+                    witnessUtxo: witnessUtxo,
                 });
+                psbtStart.addOutput(fixedOutput);
+
+                // Add change output if needed
+                if (needChangeFeeOutput) {
+                    psbtStart.addOutput({
+                        address: fundingKeypair.address,
+                        value: differenceBetweenCalculatedAndExpected,
+                    });
+                }
+
+                prelimTx = psbtStart.data.globalMap.unsignedTx.tx;
             }
-
-            psbtStart.signInput(0, fundingKeypair.tweakedChildNode);
-            psbtStart.finalizeAllInputs();
-
-            // Extract the transaction and get its ID
-            prelimTx = psbtStart.extractTransaction();
+            // if (sequence % 10000 == 0) {
+            //     console.log(
+            //         "Started mining for sequence: " +
+            //             sequence +
+            //             " - " +
+            //             Math.min(sequence + 10000, MAX_SEQUENCE)
+            //     );
+            // }
+            prelimTx.ins[0].sequence = sequence;
             const checkTxid = prelimTx.getId();
 
             // Check if there is a valid proof of work
@@ -213,10 +212,12 @@ if (parentPort) {
             sequence++;
             generated++;
 
-            if (generated % 10000 === 0) {
+            if (generated % 100000 === 0) {
                 const hashRate = ((generated - lastGenerated) / (Date.now() - lastTime)) * 1000;
                 console.log(
-                    'Hash rate:',
+                    "workId: ",
+                    workId,
+                    ' Hash rate:',
                     hashRate.toFixed(2),
                     'Op/s ',
                 );

@@ -122,9 +122,11 @@ function logMiningProgressToConsole(
         }
         return;
     }
-    process.stdout.clearLine(0);
-    process.stdout.cursorTo(0);
-    process.stdout.write(chalk.red(txid, " nonces: ", nonces));
+    if (process.stdout.clearLine) {
+        process.stdout.clearLine(0);
+        process.stdout.cursorTo(0);
+        process.stdout.write(chalk.red(txid, " nonces: ", nonces));
+    }
 }
 
 function printBitworkLog(bitworkInfo: BitworkInfo, commit?: boolean) {
@@ -785,7 +787,7 @@ export class AtomicalOperationBuilder {
                         psbtStart.finalizeAllInputs();
 
                         const interTx = psbtStart.extractTransaction();
-
+                        commitTxid = interTx.getId();
                         const rawtx = interTx.toHex();
                         await AtomicalOperationBuilder.finalSafetyCheckForExcessiveFee(
                             psbtStart,
@@ -799,6 +801,7 @@ export class AtomicalOperationBuilder {
                             );
                         } else {
                             console.log("Success sent tx: ", interTx.getId());
+                            console.log("Success sent rawtx: ", rawtx);
                         }
 
                         commitMinedWithBitwork = true;
@@ -869,14 +872,24 @@ export class AtomicalOperationBuilder {
         ////////////////////////////////////////////////////////////////////////
 
         // The scriptP2TR and hashLockP2TR will contain the utxo needed for the commit and now can be revealed
-        const utxoOfCommitAddress = await getFundingUtxo(
-            this.options.electrumApi,
-            scriptP2TR.address,
-            this.getOutputValueForCommit(fees),
-            commitMinedWithBitwork,
-            5
-        );
-        commitTxid = utxoOfCommitAddress.txid;
+        // const utxoOfCommitAddress = await getFundingUtxo(
+        //     this.options.electrumApi,
+        //     scriptP2TR.address,
+        //     this.getOutputValueForCommit(fees),
+        //     commitMinedWithBitwork,
+        //     5
+        // );
+        // commitTxid = utxoOfCommitAddress.txid;
+
+        const utxoOfCommitAddress = {
+            txid: commitTxid || "", // Assign a default value if commitTxid is null
+            txId: commitTxid || "", // Assign a default value if commitTxid is null
+            index: 0,
+            vout: 0,
+            value: this.getOutputValueForCommit(fees),
+            outputIndex: 0
+        };
+
         atomicalId = commitTxid + "i0"; // Atomicals are always minted at the 0'th output
 
         const tapLeafScript = {
@@ -890,133 +903,84 @@ export class AtomicalOperationBuilder {
             printBitworkLog(this.bitworkInfoReveal as any);
         }
         noncesGenerated = 0;
-        do {
-            let totalInputsforReveal = 0; // We calculate the total inputs for the reveal to determine to make change output or not
-            let totalOutputsForReveal = 0; // Calculate total outputs for the reveal and compare to totalInputsforReveal and reveal fee
-            let nonce = Math.floor(Math.random() * 100000000);
-            let unixTime = Math.floor(Date.now() / 1000);
-            let psbt = new Psbt({ network: NETWORK });
-            psbt.setVersion(1);
+
+        let totalInputsforReveal = 0; // We calculate the total inputs for the reveal to determine to make change output or not
+        let totalOutputsForReveal = 0; // Calculate total outputs for the reveal and compare to totalInputsforReveal and reveal fee
+        // let nonce = Math.floor(Math.random() * 100000000);
+        // let unixTime = Math.floor(Date.now() / 1000);
+        let psbt = new Psbt({ network: NETWORK });
+        psbt.setVersion(1);
+        psbt.addInput({
+            sequence: this.options.rbf ? RBF_INPUT_SEQUENCE : undefined,
+            hash: utxoOfCommitAddress.txid,
+            index: utxoOfCommitAddress.vout,
+            witnessUtxo: {
+                value: utxoOfCommitAddress.value,
+                script: hashLockP2TR.output!,
+            },
+            tapLeafScript: [tapLeafScript],
+        });
+        totalInputsforReveal += utxoOfCommitAddress.value;
+
+        // Add any additional inputs that were assigned
+        for (const additionalInput of this.inputUtxos) {
             psbt.addInput({
                 sequence: this.options.rbf ? RBF_INPUT_SEQUENCE : undefined,
-                hash: utxoOfCommitAddress.txid,
-                index: utxoOfCommitAddress.vout,
-                witnessUtxo: {
-                    value: utxoOfCommitAddress.value,
-                    script: hashLockP2TR.output!,
-                },
-                tapLeafScript: [tapLeafScript],
+                hash: additionalInput.utxo.hash,
+                index: additionalInput.utxo.index,
+                witnessUtxo: additionalInput.utxo.witnessUtxo,
+                tapInternalKey:
+                    additionalInput.keypairInfo.childNodeXOnlyPubkey,
             });
-            totalInputsforReveal += utxoOfCommitAddress.value;
+            totalInputsforReveal += additionalInput.utxo.witnessUtxo.value;
+        }
 
-            // Add any additional inputs that were assigned
-            for (const additionalInput of this.inputUtxos) {
-                psbt.addInput({
-                    sequence: this.options.rbf ? RBF_INPUT_SEQUENCE : undefined,
-                    hash: additionalInput.utxo.hash,
-                    index: additionalInput.utxo.index,
-                    witnessUtxo: additionalInput.utxo.witnessUtxo,
-                    tapInternalKey:
-                        additionalInput.keypairInfo.childNodeXOnlyPubkey,
-                });
-                totalInputsforReveal += additionalInput.utxo.witnessUtxo.value;
-            }
+        // Note, we do not assign any outputs by default.
+        // The caller must decide how many outputs to assign always
+        // The reason is the caller knows the context to create them in
+        // Add any additional outputs that were assigned
+        for (const additionalOutput of this.additionalOutputs) {
+            psbt.addOutput({
+                address: additionalOutput.address,
+                value: additionalOutput.value,
+            });
+            totalOutputsForReveal += additionalOutput.value;
+        }
 
-            // Note, we do not assign any outputs by default.
-            // The caller must decide how many outputs to assign always
-            // The reason is the caller knows the context to create them in
-            // Add any additional outputs that were assigned
-            for (const additionalOutput of this.additionalOutputs) {
-                psbt.addOutput({
-                    address: additionalOutput.address,
-                    value: additionalOutput.value,
-                });
-                totalOutputsForReveal += additionalOutput.value;
-            }
+        if (parentAtomicalInfo) {
+            psbt.addInput({
+                sequence: this.options.rbf ? RBF_INPUT_SEQUENCE : undefined,
+                hash: parentAtomicalInfo.parentUtxoPartial.hash,
+                index: parentAtomicalInfo.parentUtxoPartial.index,
+                witnessUtxo:
+                    parentAtomicalInfo.parentUtxoPartial.witnessUtxo,
+                tapInternalKey:
+                    parentAtomicalInfo.parentKeyInfo.childNodeXOnlyPubkey,
+            });
+            totalInputsforReveal +=
+                parentAtomicalInfo.parentUtxoPartial.witnessUtxo.value;
+            psbt.addOutput({
+                address: parentAtomicalInfo.parentKeyInfo.address,
+                value: parentAtomicalInfo.parentUtxoPartial.witnessUtxo
+                    .value,
+            });
+            totalOutputsForReveal +=
+                parentAtomicalInfo.parentUtxoPartial.witnessUtxo.value;
+        }
 
-            if (parentAtomicalInfo) {
-                psbt.addInput({
-                    sequence: this.options.rbf ? RBF_INPUT_SEQUENCE : undefined,
-                    hash: parentAtomicalInfo.parentUtxoPartial.hash,
-                    index: parentAtomicalInfo.parentUtxoPartial.index,
-                    witnessUtxo:
-                        parentAtomicalInfo.parentUtxoPartial.witnessUtxo,
-                    tapInternalKey:
-                        parentAtomicalInfo.parentKeyInfo.childNodeXOnlyPubkey,
-                });
-                totalInputsforReveal +=
-                    parentAtomicalInfo.parentUtxoPartial.witnessUtxo.value;
-                psbt.addOutput({
-                    address: parentAtomicalInfo.parentKeyInfo.address,
-                    value: parentAtomicalInfo.parentUtxoPartial.witnessUtxo
-                        .value,
-                });
-                totalOutputsForReveal +=
-                    parentAtomicalInfo.parentUtxoPartial.witnessUtxo.value;
-            }
+        this.addRevealOutputIfChangeRequired(
+            totalInputsforReveal,
+            totalOutputsForReveal,
+            fees.revealFeeOnly,
+            fundingKeypair.address
+        );
 
-            if (noncesGenerated % 10000 == 0) {
-                unixTime = Math.floor(Date.now() / 1000);
-            }
-            const data = Buffer.from(unixTime + ":" + nonce, "utf8");
-            const embed = bitcoin.payments.embed({ data: [data] });
+        let prelimTx;
+        prelimTx = psbt.data.globalMap.unsignedTx;
+        do {
+            prelimTx.tx.ins[0].sequence = noncesGenerated;
+            const checkTxid = prelimTx.tx.getId();
 
-            if (performBitworkForRevealTx) {
-                psbt.addOutput({
-                    script: embed.output!,
-                    value: 0,
-                });
-            }
-            this.addRevealOutputIfChangeRequired(
-                totalInputsforReveal,
-                totalOutputsForReveal,
-                fees.revealFeeOnly,
-                fundingKeypair.address
-            );
-
-            psbt.signInput(0, fundingKeypair.childNode);
-            // Sign all the additional inputs, if there were any
-            let signInputIndex = 1;
-            for (const additionalInput of this.inputUtxos) {
-                psbt.signInput(
-                    signInputIndex,
-                    additionalInput.keypairInfo.tweakedChildNode
-                );
-                signInputIndex++;
-            }
-            if (parentAtomicalInfo) {
-                console.log("parentAtomicalInfo", parentAtomicalInfo);
-                psbt.signInput(
-                    signInputIndex,
-                    parentAtomicalInfo.parentKeyInfo.tweakedChildNode
-                );
-            }
-            // We have to construct our witness script in a custom finalizer
-            const customFinalizer = (_inputIndex: number, input: any) => {
-                const scriptSolution = [input.tapScriptSig[0].signature];
-                const witness = scriptSolution
-                    .concat(tapLeafScript.script)
-                    .concat(tapLeafScript.controlBlock);
-                return {
-                    finalScriptWitness: witnessStackToScriptWitness(witness),
-                };
-            };
-            psbt.finalizeInput(0, customFinalizer);
-            // Finalize all the additional inputs, if there were any
-            let finalizeInputIndex = 1;
-            for (
-                ;
-                finalizeInputIndex <= this.inputUtxos.length;
-                finalizeInputIndex++
-            ) {
-                psbt.finalizeInput(finalizeInputIndex);
-            }
-            if (parentAtomicalInfo) {
-                psbt.finalizeInput(finalizeInputIndex);
-            }
-
-            const revealTx = psbt.extractTransaction();
-            const checkTxid = revealTx.getId();
             logMiningProgressToConsole(
                 performBitworkForRevealTx,
                 this.options.disableMiningChalk,
@@ -1032,14 +996,16 @@ export class AtomicalOperationBuilder {
                     this.bitworkInfoReveal?.ext as any
                 )
             ) {
-                process.stdout.clearLine(0);
-                process.stdout.cursorTo(0);
-                process.stdout.write(
-                    chalk.green(checkTxid, " nonces: " + noncesGenerated)
-                );
+                if  ( process.stdout.clearLine){
+                    process.stdout.clearLine(0);
+                    process.stdout.cursorTo(0);
+                    process.stdout.write(
+                        chalk.green(checkTxid, " nonces: " + noncesGenerated)
+                    );
+                }
                 console.log(
                     "\nBitwork matches reveal txid! ",
-                    revealTx.getId(),
+                    checkTxid,
                     "@ time: " + Math.floor(Date.now() / 1000)
                 );
                 shouldBroadcast = true;
@@ -1047,6 +1013,49 @@ export class AtomicalOperationBuilder {
             // Broadcast either because there was no bitwork requested, and we are done. OR...
             // broadcast because we found the bitwork and it is ready to be broadcasted
             if (shouldBroadcast) {
+                psbt.signInput(0, fundingKeypair.childNode);
+                // Sign all the additional inputs, if there were any
+                let signInputIndex = 1;
+                for (const additionalInput of this.inputUtxos) {
+                    psbt.signInput(
+                        signInputIndex,
+                        additionalInput.keypairInfo.tweakedChildNode
+                    );
+                    signInputIndex++;
+                }
+                if (parentAtomicalInfo) {
+                    console.log("parentAtomicalInfo", parentAtomicalInfo);
+                    psbt.signInput(
+                        signInputIndex,
+                        parentAtomicalInfo.parentKeyInfo.tweakedChildNode
+                    );
+                }
+                // We have to construct our witness script in a custom finalizer
+                const customFinalizer = (_inputIndex: number, input: any) => {
+                    const scriptSolution = [input.tapScriptSig[0].signature];
+                    const witness = scriptSolution
+                        .concat(tapLeafScript.script)
+                        .concat(tapLeafScript.controlBlock);
+                    return {
+                        finalScriptWitness: witnessStackToScriptWitness(witness),
+                    };
+                };
+                psbt.finalizeInput(0, customFinalizer);
+                // Finalize all the additional inputs, if there were any
+                let finalizeInputIndex = 1;
+                for (
+                    ;
+                    finalizeInputIndex <= this.inputUtxos.length;
+                    finalizeInputIndex++
+                ) {
+                    psbt.finalizeInput(finalizeInputIndex);
+                }
+                if (parentAtomicalInfo) {
+                    psbt.finalizeInput(finalizeInputIndex);
+                }
+    
+                const revealTx = psbt.extractTransaction();
+
                 console.log("\nPrint raw tx in case of broadcast failure", revealTx.toHex());
                 await AtomicalOperationBuilder.finalSafetyCheckForExcessiveFee(
                     psbt,
@@ -1062,11 +1071,12 @@ export class AtomicalOperationBuilder {
                     );
                 } else {
                     console.log("Success sent tx: ", revealTx.getId());
+                    console.log("Success sent rawtx: ", rawtx);
                 }
                 revealTxid = interTx.getId();
                 performBitworkForRevealTx = false; // Done
             }
-            nonce++;
+            //nonce++;
             noncesGenerated++;
         } while (performBitworkForRevealTx);
 
@@ -1166,7 +1176,7 @@ export class AtomicalOperationBuilder {
         let hashLockCompactSizeBytes = 9;
         let op_Return_SizeBytes = 0;
         if(performBitworkForRevealTx){
-            op_Return_SizeBytes = OP_RETURN_BYTES;
+            op_Return_SizeBytes = 0;
         }
         if (hashLockP2TROutputLen <= 252) {
             hashLockCompactSizeBytes = 1;
